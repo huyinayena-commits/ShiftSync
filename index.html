@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description"
+        content="TSM Shift Scheduler - Aplikasi pembuat jadwal shift otomatis dengan aturan operasional yang ketat">
+    <title>TSM Shift Scheduler</title>
+    <link rel="stylesheet" href="index.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="header-inner">
+                <h1>TSM Shift Scheduler</h1>
+                <button id="settingsBtn" class="btn-icon" aria-label="Pengaturan Jadwal">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"></circle>
+                        <path
+                            d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z">
+                        </path>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <!-- Panel Utama - Tabel Jadwal (Prioritas 1) -->
+            <section class="schedule-panel">
+                <div class="schedule-header">
+                    <h2>Jadwal Shift</h2>
+                    <div class="schedule-actions">
+                        <button type="button" id="printBtn" class="btn btn-secondary" style="display: none;">
+                            Cetak PDF
+                        </button>
+                    </div>
+                </div>
+
+                <div class="table-container">
+                    <table id="scheduleTable" class="schedule-table">
+                        <thead id="tableHead"></thead>
+                        <tbody id="tableBody"></tbody>
+                    </table>
+                </div>
+
+                <!-- Legenda Inline (Prioritas 3) -->
+                <div class="legend-inline">
+                    <span class="legend-item"><span class="shift-badge shift-1">1</span> Pagi</span>
+                    <span class="legend-item"><span class="shift-badge shift-2">2</span> Siang</span>
+                    <span class="legend-item"><span class="shift-badge shift-off">OFF</span> Libur</span>
+                    <span class="legend-item"><span class="pk-indicator"></span> PK</span>
+                    <span class="legend-item"><span class="lock-indicator">L</span> Edit</span>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Modal Pengaturan Jadwal -->
+    <div id="settingsModal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Pengaturan Jadwal</h2>
+                <button type="button" id="closeSettings" class="btn-icon-close" aria-label="Tutup">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="startDate">Tanggal Mulai</label>
+                        <input type="date" id="startDate" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="endDate">Tanggal Selesai</label>
+                        <input type="date" id="endDate" required>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="eventDates">Tanggal Event (Opsional)</label>
+                    <input type="text" id="eventDates" placeholder="2026-02-14, 2026-02-28">
+                    <small class="hint">Pisahkan dengan koma</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" id="prepareBtn" class="btn btn-primary">
+                    SIAPKAN JADWAL
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Kondisi H-1 -->
+    <div id="conditionModal" class="modal">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Kondisi Hari Sebelumnya (H-1)</h2>
+                <p>Informasi ini penting untuk memulai rotasi dengan benar</p>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="pkYesterday">Siapa Pemegang Kunci (Shift 2) Kemarin?</label>
+                    <select id="pkYesterday" required>
+                        <option value="">-- Pilih Leader --</option>
+                        <option value="CIF">CIF</option>
+                        <option value="SSL">SSL</option>
+                        <option value="SJL">SJL</option>
+                    </select>
+                    <small class="hint">Orang ini akan masuk Shift 1 (Pagi) di hari pertama jadwal.</small>
+                </div>
+                <div class="form-group">
+                    <label for="offYesterday">Siapa yang Libur (OFF) Kemarin?</label>
+                    <select id="offYesterday" required>
+                        <option value="">-- Pilih Anggota --</option>
+                        <option value="none">Tidak ada yang libur</option>
+                    </select>
+                    <small class="hint">Orang ini akan masuk Shift 2 (Siang) di hari pertama jadwal.</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" id="cancelModal" class="btn btn-ghost">Batal</button>
+                <button type="button" id="executeBtn" class="btn btn-primary">EKSEKUSI</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
