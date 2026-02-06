@@ -135,6 +135,15 @@ function getDateRange(startDate, endDate) {
     return dates;
 }
 
+// Acak urutan array (Fisher-Yates Shuffle)
+function shuffleArray(array) {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+    return array;
+}
+
 // =============================================
 // CONSTRAINT VALIDATORS
 // =============================================
@@ -197,13 +206,26 @@ function countWeeklyOff(schedule, dateStr, memberId) {
 // =============================================
 
 // Generate jadwal otomatis
+// Generate jadwal otomatis
 function generateSchedule() {
     const dates = getDateRange(scheduleData.startDate, scheduleData.endDate);
     const schedule = {};
 
-    // Kondisi H-1
-    let lastPK = scheduleData.pkYesterday;
-    let lastOff = scheduleData.offYesterday;
+    // Auto-detect Kondisi H-1 dari Global Grid Data
+    let lastPK = null;
+    let lastOff = null;
+
+    if (dates.length > 0) {
+        const prevDate = getPrevDate(dates[0]);
+        const prevData = scheduleData.schedule[prevDate];
+        if (prevData) {
+            const pkMember = TEAM.find(m => prevData[m.id]?.isPK);
+            lastPK = pkMember ? pkMember.id : null;
+
+            const offMember = TEAM.find(m => prevData[m.id]?.shift === 'OFF');
+            lastOff = offMember ? offMember.id : 'none'; // 'none' jika tidak ada yang off (misal awal bulan/reset)
+        }
+    }
 
     // Track shift berturut-turut untuk anti-monoton
     const consecutiveShifts = {};
@@ -216,6 +238,7 @@ function generateSchedule() {
     for (let i = 0; i < dates.length; i++) {
         const dateStr = dates[i];
         const isEvent = scheduleData.eventDates.includes(dateStr);
+        const dayOfWeek = parseDate(dateStr).getDay(); // 0=Minggu
 
         schedule[dateStr] = {};
 
@@ -224,27 +247,25 @@ function generateSchedule() {
 
         // Step 1: Terapkan constraint wajib
         TEAM.forEach(member => {
-            // Cek jika cell sudah di-lock
             if (existingDay && existingDay[member.id]?.isLocked) {
                 schedule[dateStr][member.id] = { ...existingDay[member.id] };
                 return;
             }
-
             schedule[dateStr][member.id] = { shift: null, isPK: false, isLocked: false };
         });
 
-        // Step 2: Yang pegang kunci kemarin wajib Shift 1
+        // Step 2 & 3: Wajib Shift 1/2 dari kemarin
         if (lastPK && !schedule[dateStr][lastPK]?.isLocked) {
             schedule[dateStr][lastPK].shift = 1;
         }
-
-        // Step 3: Yang OFF kemarin wajib Shift 2
         if (lastOff && lastOff !== 'none' && !schedule[dateStr][lastOff]?.isLocked) {
             schedule[dateStr][lastOff].shift = 2;
         }
 
-        // Step 4: Assign shift untuk member yang belum dapat
-        const unassigned = TEAM.filter(m => schedule[dateStr][m.id].shift === null);
+        // Step 4: Assign shift
+        let unassigned = TEAM.filter(m => schedule[dateStr][m.id].shift === null);
+        // RANDOMIZE agar adil dalam distribusi libur
+        unassigned = shuffleArray(unassigned);
 
         unassigned.forEach(member => {
             const prevDateStr = i > 0 ? dates[i - 1] : null;
@@ -252,58 +273,65 @@ function generateSchedule() {
 
             // Cek kuota OFF mingguan
             const weeklyOffCount = countWeeklyOff(schedule, dateStr, member.id);
-            const canTakeOff = !isEvent && weeklyOffCount < 1;
+            // Mandatory Off Logic: Wajib ambil libur jika belum dapat jatah di akhir minggu
+            const isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
+            const mandatoryOff = (weeklyOffCount === 0 && dayOfWeek === 0) || (weeklyOffCount === 0 && dayOfWeek === 6 && !isEvent);
 
-            // Hitung skor untuk setiap opsi shift
+            const canTakeOff = !isEvent && (weeklyOffCount < 1 || mandatoryOff);
+
             let bestShift = null;
             let bestScore = -Infinity;
 
             const options = canTakeOff ? [1, 2, 'OFF'] : [1, 2];
 
+            // Cek distribusi OFF harian (Target: 1 orang OFF per hari)
+            const currentOffCount = Object.values(schedule[dateStr]).filter(s => s.shift === 'OFF').length;
+
             options.forEach(shift => {
                 let score = 0;
                 const consec = consecutiveShifts[member.id];
 
-                // Anti-zigzag: Bonus besar jika shift sama dengan kemarin (mendorong 1-1-2-2)
+                // --- LOGIC LIBUR ---
+                if (shift === 'OFF') {
+                    if (weeklyOffCount === 0) {
+                        score += 60; // Base priority tinggi untuk ambil jatah libur
+                        if (mandatoryOff) score += 1000; // Force OFF (Sangat tinggi)
+                        else if (dayOfWeek >= 5) score += 40; // Urgent Jumat-Sabtu
+                    } else {
+                        score -= 50; // Sudah libur, prioritas rendah
+                    }
+
+                    // Balance Daily Off: Target 1 orang
+                    if (currentOffCount === 0) score += 25; // Dorong agar ada yang libur
+                    else if (currentOffCount >= 1) score -= 15; // Tahan agar tidak kekurangan orang
+                }
+
+                // --- LOGIC KERJA ---
+                // Anti-zigzag
                 if (prevShift === shift && shift !== 'OFF') {
-                    // Bonus untuk konsistensi, tapi batasi agar tidak terlalu lama
-                    if (consec.count < 2) {
-                        score += 25; // Bonus besar untuk hari ke-2 dengan shift sama
-                    } else if (consec.count >= 3) {
-                        score -= 15; // Penalti jika sudah 3+ hari sama (anti-monoton)
-                    }
+                    if (consec.count < 2) score += 25;
+                    else if (consec.count >= 3) score -= 15;
                 }
 
-                // Penalti untuk zigzag (1-2-1-2)
                 if (prevShift !== null && prevShift !== 'OFF' && shift !== 'OFF' && prevShift !== shift) {
-                    // Cek apakah 2 hari lalu shift-nya sama dengan hari ini (pola zigzag)
-                    if (consec.count === 1 && consec.shift !== shift) {
-                        score -= 20; // Penalti untuk pola zigzag
-                    }
+                    if (consec.count === 1 && consec.shift !== shift) score -= 20;
                 }
 
-                // Preference: sebelum OFF harus Shift 1
-                if (shift === 'OFF' && prevShift !== 1) {
-                    score -= 20;
-                }
+                if (shift === 'OFF' && prevShift !== 1) score -= 20;
 
-                // Balance: coba seimbangkan distribusi shift
+                // Balance Shifts
                 const shift1Count = Object.values(schedule[dateStr]).filter(s => s.shift === 1).length;
                 const shift2Count = Object.values(schedule[dateStr]).filter(s => s.shift === 2).length;
-
                 if (shift === 1 && shift1Count < shift2Count) score += 5;
                 if (shift === 2 && shift2Count < shift1Count) score += 5;
 
-                // Leader separation: CIF dan SSL tidak boleh sama shift
+                // Leader Separation
                 if (member.id === 'CIF' || member.id === 'SSL') {
                     const otherId = member.id === 'CIF' ? 'SSL' : 'CIF';
                     const otherShift = schedule[dateStr][otherId]?.shift;
-                    if (otherShift === shift && shift !== 'OFF') {
-                        score -= 100;
-                    }
+                    if (otherShift === shift && shift !== 'OFF') score -= 100;
                 }
 
-                // Random factor untuk variasi (dikurangi agar lebih konsisten)
                 score += Math.random() * 2;
 
                 if (score > bestScore) {
@@ -315,17 +343,14 @@ function generateSchedule() {
             schedule[dateStr][member.id].shift = bestShift;
         });
 
-        // Step 5: Validasi dan perbaiki jika perlu
+        // Step 5: Validasi
         fixConstraintViolations(schedule, dateStr, isEvent);
 
-        // Step 6: Assign PK untuk besok (dari yang Shift 2, pilih leader dengan distribusi paling rendah)
+        // Step 6: Assign PK
         const shift2Leaders = LEADERS.filter(l => schedule[dateStr][l.id].shift === 2);
-
         if (shift2Leaders.length > 0) {
-            // Pilih leader dengan PK count terendah
             shift2Leaders.sort((a, b) => pkCount[a.id] - pkCount[b.id]);
             const selectedPK = shift2Leaders[0].id;
-
             schedule[dateStr][selectedPK].isPK = true;
             pkCount[selectedPK]++;
             lastPK = selectedPK;
@@ -333,11 +358,11 @@ function generateSchedule() {
             lastPK = null;
         }
 
-        // Step 7: Catat siapa yang OFF hari ini
+        // Step 7: Catat OFF
         const offToday = TEAM.find(m => schedule[dateStr][m.id].shift === 'OFF');
         lastOff = offToday ? offToday.id : 'none';
 
-        // Update consecutive shifts tracker
+        // Update consecutive
         TEAM.forEach(m => {
             const shift = schedule[dateStr][m.id].shift;
             if (consecutiveShifts[m.id].shift === shift) {
@@ -494,21 +519,33 @@ function fixConstraintViolations(schedule, dateStr, isEvent) {
 }
 
 // =============================================
-// UI RENDERING
+// UI RENDERING (IMMUTABLE STATIC GRID)
 // =============================================
 
-// Render tabel kosong (tanpa jadwal) berdasarkan tanggal yang dipilih
-function renderEmptyTable() {
-    const startDate = document.getElementById('startDate').value;
-    const endDate = document.getElementById('endDate').value;
+// Inisialisasi Grid Statis (Absolut Calendar Schema)
+// Dipanggil HANYA SEKALI saat load halaman atau ganti konteks bulan (eksplisit)
+function initializeStaticGrid() {
+    // Gunakan bulan saat ini sebagai referensi schema standar
+    const today = new Date();
+    const currentYear = today.getFullYear();
+    const currentMonth = today.getMonth(); // 0-11
 
-    if (!startDate || !endDate) return;
+    // Schema Standar: Tanggal 1 sampai akhir bulan
+    const firstDay = new Date(currentYear, currentMonth, 1);
+    const lastDay = new Date(currentYear, currentMonth + 1, 0);
 
-    const dates = getDateRange(startDate, endDate);
+    // Set default value selector (Data Layer) agar sinkron dengan View tapi tidak trigger re-render
+    const startDateInput = document.getElementById('startDate');
+    const endDateInput = document.getElementById('endDate');
+
+    if (!startDateInput.value) startDateInput.value = formatDate(firstDay);
+    if (!endDateInput.value) endDateInput.value = formatDate(lastDay);
+
+    const dates = getDateRange(formatDate(firstDay), formatDate(lastDay));
     const tableHead = document.getElementById('tableHead');
     const tableBody = document.getElementById('tableBody');
 
-    // Render header
+    // 1. Render Header (Structural Layer - Fixed)
     let headerHTML = '<tr><th>Anggota</th>';
     dates.forEach(dateStr => {
         const date = parseDate(dateStr);
@@ -530,12 +567,13 @@ function renderEmptyTable() {
     headerHTML += '</tr>';
     tableHead.innerHTML = headerHTML;
 
-    // Render body dengan cell kosong
+    // 2. Render Body Grid (Structural Layer - Fixed)
     let bodyHTML = '';
     TEAM.forEach(member => {
         bodyHTML += `<tr><th>${member.name}</th>`;
 
         dates.forEach(dateStr => {
+            // Render sel kosong (Placeholder)
             bodyHTML += `<td data-date="${dateStr}" data-member="${member.id}">
                 <span class="shift-badge">-</span>
             </td>`;
@@ -544,79 +582,80 @@ function renderEmptyTable() {
         bodyHTML += '</tr>';
     });
     tableBody.innerHTML = bodyHTML;
-}
 
-// Render tabel jadwal
-function renderScheduleTable() {
-    const dates = getDateRange(scheduleData.startDate, scheduleData.endDate);
-    const tableHead = document.getElementById('tableHead');
-    const tableBody = document.getElementById('tableBody');
-
-    // Render header
-    let headerHTML = '<tr><th>Anggota</th>';
-    dates.forEach(dateStr => {
-        const date = parseDate(dateStr);
-        const dayIndex = date.getDay();
-        const dayName = DAY_NAMES_SHORT[dayIndex];
-        const dayNum = date.getDate();
-        const isHoliday = isNationalHoliday(dateStr);
-        const holidayName = getHolidayName(dateStr);
-        const isEvent = scheduleData.eventDates.includes(dateStr);
-
-        let classes = 'date-header';
-        if (isHoliday) classes += ' holiday';
-        if (isEvent) classes += ' event';
-
-        const tooltip = holidayName ? ` title="${holidayName}"` : '';
-        headerHTML += `<th class="${classes}"${tooltip}>
-            ${dayNum}
-            <span class="day-name">${dayName}</span>
-        </th>`;
-    });
-    headerHTML += '</tr>';
-    tableHead.innerHTML = headerHTML;
-
-    // Render body
-    let bodyHTML = '';
-    TEAM.forEach(member => {
-        bodyHTML += `<tr><th>${member.name}</th>`;
-
-        dates.forEach(dateStr => {
-            const cellData = scheduleData.schedule[dateStr]?.[member.id] || { shift: '-', isPK: false, isLocked: false };
-            const shift = cellData.shift;
-            const isPK = cellData.isPK;
-            const isLocked = cellData.isLocked;
-
-            let shiftClass = '';
-            let shiftText = '-';
-
-            if (shift === 1) {
-                shiftClass = 'shift-1';
-                shiftText = '1';
-            } else if (shift === 2) {
-                shiftClass = 'shift-2';
-                shiftText = '2';
-            } else if (shift === 'OFF') {
-                shiftClass = 'shift-off';
-                shiftText = 'OFF';
-            }
-
-            if (isPK) shiftClass += ' has-pk';
-            if (isLocked) shiftClass += ' is-locked';
-
-            bodyHTML += `<td data-date="${dateStr}" data-member="${member.id}">
-                <span class="shift-badge ${shiftClass}">${shiftText}</span>
-            </td>`;
-        });
-
-        bodyHTML += '</tr>';
-    });
-    tableBody.innerHTML = bodyHTML;
-
-    // Add click handlers untuk edit manual
+    // Attach interaction handlers (Read/Write Data Layer)
     tableBody.querySelectorAll('td').forEach(cell => {
         cell.addEventListener('click', handleCellClick);
     });
+
+    console.log("Static Grid Initialized: Structure Locked.");
+}
+
+// Update Values pada Grid (Data Injection)
+// TIDAK PERNAH mengubah struktur tabel (baris/kolom)
+function updateGridValues() {
+    console.log("Mapping Data to Static Grid...");
+    const tableBody = document.getElementById('tableBody');
+
+    // Iterasi setiap cell yang ADA di tabel (View Driven)
+    const cells = tableBody.querySelectorAll('td[data-date]');
+
+    cells.forEach(cell => {
+        const dateStr = cell.dataset.date;
+        const memberId = cell.dataset.member;
+
+        // Ambil data jika ada (Data Layer)
+        const cellData = scheduleData.schedule[dateStr]?.[memberId];
+
+        const badge = cell.querySelector('.shift-badge');
+        if (!badge) return;
+
+        // Default state (Empty/Reset)
+        let shiftClass = 'shift-badge';
+        let shiftText = '-';
+
+        if (cellData) {
+            const shift = cellData.shift;
+
+            if (shift === 1) {
+                shiftClass += ' shift-1';
+                shiftText = '1';
+            } else if (shift === 2) {
+                shiftClass += ' shift-2';
+                shiftText = '2';
+            } else if (shift === 'OFF') {
+                shiftClass += ' shift-off';
+                shiftText = 'OFF';
+            }
+
+            if (cellData.isPK) shiftClass += ' has-pk';
+            if (cellData.isLocked) shiftClass += ' is-locked';
+        }
+
+        // Apply visual state (Mutation minimal)
+        if (badge.className !== shiftClass) badge.className = shiftClass;
+        if (badge.textContent !== shiftText) badge.textContent = shiftText;
+    });
+
+    // Update Header Event Markers jika perlu (Optional, visual only, tanpa ubah struktur)
+    const tableHead = document.getElementById('tableHead');
+    const headerCells = tableHead.querySelectorAll('th.date-header');
+
+    // Kita asumsikan grid statis selalu mulai dari tanggal 1 bulan saat ini
+    const today = new Date();
+    const currentMonth = today.getMonth();
+    const currentYear = today.getFullYear();
+    const dates = getDateRange(formatDate(new Date(currentYear, currentMonth, 1)), formatDate(new Date(currentYear, currentMonth + 1, 0)));
+
+    if (headerCells.length === dates.length) {
+        headerCells.forEach((th, index) => {
+            const dateStr = dates[index];
+            const isEvent = scheduleData.eventDates.includes(dateStr);
+            // Toggle event class
+            if (isEvent) th.classList.add('event');
+            else th.classList.remove('event');
+        });
+    }
 }
 
 // Handle klik pada cell untuk edit manual
@@ -625,7 +664,19 @@ function handleCellClick(event) {
     const dateStr = cell.dataset.date;
     const memberId = cell.dataset.member;
 
-    if (!scheduleData.schedule[dateStr] || !scheduleData.schedule[dateStr][memberId]) return;
+    // Auto-init jika data schedule belum ada (Fitur Input Manual Awal)
+    if (!scheduleData.schedule[dateStr]) {
+        scheduleData.schedule[dateStr] = {};
+        // Perlu inisialisasi struktur member dasar agar tidak error akses property nanti
+        TEAM.forEach(m => {
+            scheduleData.schedule[dateStr][m.id] = { shift: null, isPK: false, isLocked: false };
+        });
+    }
+
+    if (!scheduleData.schedule[dateStr][memberId]) {
+        // Init data object jika belum ada
+        scheduleData.schedule[dateStr][memberId] = { shift: '-', isPK: false, isLocked: false };
+    }
 
     const cellData = scheduleData.schedule[dateStr][memberId];
     const currentShift = cellData.shift;
@@ -636,20 +687,19 @@ function handleCellClick(event) {
     else if (currentShift === 2) newShift = 'OFF';
     else newShift = 1;
 
-    // Update dan lock
+    // Update Data Layer
     cellData.shift = newShift;
     cellData.isLocked = true;
 
-    // Reset PK jika perlu
     if (cellData.isPK && newShift !== 2) {
         cellData.isPK = false;
     }
 
-    // Regenerate jadwal dari hari ini ke depan
+    // Recalculate Logic Layer
     regenerateFromDate(dateStr);
 
-    // Re-render
-    renderScheduleTable();
+    // Refresh View Layer
+    updateGridValues();
 }
 
 // Regenerate jadwal dari tanggal tertentu ke depan
@@ -700,6 +750,7 @@ function regenerateFromDate(fromDate) {
     for (let i = fromIndex; i < dates.length; i++) {
         const dateStr = dates[i];
         const isEvent = scheduleData.eventDates.includes(dateStr);
+        const dayOfWeek = parseDate(dateStr).getDay();
 
         // Inisialisasi jika belum ada
         if (!scheduleData.schedule[dateStr]) {
@@ -729,28 +780,39 @@ function regenerateFromDate(fromDate) {
         }
 
         // Assign shift untuk yang belum dapat
-        const unassigned = TEAM.filter(m =>
+        let unassigned = TEAM.filter(m =>
             scheduleData.schedule[dateStr][m.id].shift === null &&
             !scheduleData.schedule[dateStr][m.id].isLocked
         );
+
+        // RANDOMIZE agar adil
+        unassigned = shuffleArray(unassigned);
 
         unassigned.forEach(member => {
             const prevDateStr = i > 0 ? dates[i - 1] : null;
             const prevShift = prevDateStr ? scheduleData.schedule[prevDateStr]?.[member.id]?.shift : null;
 
             const weeklyOffCount = countWeeklyOff(scheduleData.schedule, dateStr, member.id);
-            const canTakeOff = !isEvent && weeklyOffCount < 1;
+
+            // Mandatory Off Logic
+            const isWeekend = (dayOfWeek === 0 || dayOfWeek === 6);
+            const mandatoryOff = (weeklyOffCount === 0 && dayOfWeek === 0) || (weeklyOffCount === 0 && dayOfWeek === 6 && !isEvent);
+
+            const canTakeOff = !isEvent && (weeklyOffCount < 1 || mandatoryOff);
 
             let bestShift = null;
             let bestScore = -Infinity;
 
             const options = canTakeOff ? [1, 2, 'OFF'] : [1, 2];
 
+            // Cek distribusi OFF harian
+            const currentOffCount = Object.values(scheduleData.schedule[dateStr]).filter(s => s.shift === 'OFF').length;
+
             options.forEach(shift => {
                 let score = 0;
                 const consec = consecutiveShifts[member.id];
 
-                // Anti-zigzag: Bonus besar jika shift sama dengan kemarin
+                // Anti-zigzag: Bonus besar jika shift sama dengan kemarin (mendorong 1-1-2-2)
                 if (prevShift === shift && shift !== 'OFF') {
                     if (consec.count < 2) {
                         score += 25;
@@ -764,6 +826,20 @@ function regenerateFromDate(fromDate) {
                     if (consec.count === 1 && consec.shift !== shift) {
                         score -= 20;
                     }
+                }
+
+                // Balance Daily Off
+                if (shift === 'OFF') {
+                    if (weeklyOffCount === 0) {
+                        score += 60;
+                        if (mandatoryOff) score += 1000;
+                        else if (dayOfWeek >= 5) score += 40;
+                    } else {
+                        score -= 50;
+                    }
+
+                    if (currentOffCount === 0) score += 25;
+                    else if (currentOffCount >= 1) score -= 15;
                 }
 
                 if (shift === 'OFF' && prevShift !== 1) {
@@ -816,7 +892,6 @@ function regenerateFromDate(fromDate) {
             pkCount[selectedPK] = (pkCount[selectedPK] || 0) + 1;
             lastPK = selectedPK;
         } else {
-            // Cek apakah ada leader yang locked di shift 2
             const lockedPK = LEADERS.find(l => daySchedule[l.id].shift === 2 && daySchedule[l.id].isLocked);
             if (lockedPK) {
                 daySchedule[lockedPK.id].isPK = true;
@@ -842,134 +917,168 @@ function regenerateFromDate(fromDate) {
     }
 }
 
+
 // =============================================
 // EVENT HANDLERS
 // =============================================
 
 document.addEventListener('DOMContentLoaded', function () {
-    const prepareBtn = document.getElementById('prepareBtn');
-    const executeBtn = document.getElementById('executeBtn');
-    const cancelModal = document.getElementById('cancelModal');
-    const printBtn = document.getElementById('printBtn');
-    const conditionModal = document.getElementById('conditionModal');
+    // 1. Initialize Static View (Structural Layer)
+    initializeStaticGrid();
+
+    // Elements
     const settingsModal = document.getElementById('settingsModal');
     const settingsBtn = document.getElementById('settingsBtn');
     const closeSettingsBtn = document.getElementById('closeSettings');
-    const offYesterdaySelect = document.getElementById('offYesterday');
+
+    // Action Buttons
+    const generateBtn = document.getElementById('prepareBtn');
+    const fastGenerateBtn = document.getElementById('fastGenerateBtn');
+    const printBtn = document.getElementById('printBtn');
+
+    // UI Init
+    if (generateBtn) generateBtn.textContent = 'GENERATE JADWAL';
 
     // Set default dates (bulan ini)
     const today = new Date();
     const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
     const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
 
-    document.getElementById('startDate').value = formatDate(firstDay);
-    document.getElementById('endDate').value = formatDate(lastDay);
+    const startInput = document.getElementById('startDate');
+    const endInput = document.getElementById('endDate');
+    if (startInput) startInput.value = formatDate(firstDay);
+    if (endInput) endInput.value = formatDate(lastDay);
 
-    // Populate dropdown OFF kemarin dengan semua anggota
-    TEAM.forEach(member => {
-        const option = document.createElement('option');
-        option.value = member.id;
-        option.textContent = member.name;
-        offYesterdaySelect.appendChild(option);
-    });
+    // --- SETTINGS MODAL INTERACTION ---
 
-    // Render tabel kosong saat load
-    renderEmptyTable();
+    if (settingsBtn) {
+        settingsBtn.addEventListener('click', function () {
+            settingsModal.classList.add('active');
+        });
+    }
 
-    // Update tabel saat tanggal berubah
-    document.getElementById('startDate').addEventListener('change', renderEmptyTable);
-    document.getElementById('endDate').addEventListener('change', renderEmptyTable);
+    if (closeSettingsBtn) {
+        closeSettingsBtn.addEventListener('click', function () {
+            settingsModal.classList.remove('active');
+        });
+    }
 
-    // Buka Settings Modal
-    settingsBtn.addEventListener('click', function () {
-        settingsModal.classList.add('active');
-    });
-
-    // Tutup Settings Modal
-    closeSettingsBtn.addEventListener('click', function () {
-        settingsModal.classList.remove('active');
-    });
-
-    // Klik backdrop Settings - tutup modal
-    settingsModal.querySelector('.modal-backdrop').addEventListener('click', function () {
-        settingsModal.classList.remove('active');
-    });
-
-    // Tombol SIAPKAN - validasi dan buka modal kondisi
-    prepareBtn.addEventListener('click', function () {
-        const startDate = document.getElementById('startDate').value;
-        const endDate = document.getElementById('endDate').value;
-
-        if (!startDate || !endDate) {
-            alert('Mohon isi tanggal mulai dan selesai!');
-            return;
+    if (settingsModal) {
+        const backdrop = settingsModal.querySelector('.modal-backdrop');
+        if (backdrop) {
+            backdrop.addEventListener('click', function () {
+                settingsModal.classList.remove('active');
+            });
         }
+    }
 
-        if (parseDate(startDate) > parseDate(endDate)) {
-            alert('Tanggal mulai harus sebelum tanggal selesai!');
-            return;
-        }
+    // --- FAST GENERATE ACTION (+7 Days) ---
+    if (fastGenerateBtn) {
+        fastGenerateBtn.addEventListener('click', function () {
+            // 1. Tentukan Start Date
+            let nextStart = new Date();
 
-        // Parse event dates
-        const eventDatesInput = document.getElementById('eventDates').value;
-        const eventDates = eventDatesInput
-            .split(',')
-            .map(d => d.trim())
-            .filter(d => d && /^\d{4}-\d{2}-\d{2}$/.test(d));
+            // Cek jadwal terakhir yg ada isi
+            const existingDates = Object.keys(scheduleData.schedule).sort();
+            let lastFilledDateStr = null;
 
-        scheduleData.startDate = startDate;
-        scheduleData.endDate = endDate;
-        scheduleData.eventDates = eventDates;
+            // Cari tanggal terakhir yg ada shift assign
+            for (let i = existingDates.length - 1; i >= 0; i--) {
+                const d = existingDates[i];
+                const hasData = TEAM.some(m => {
+                    const cell = scheduleData.schedule[d][m.id];
+                    return cell && cell.shift !== null;
+                });
 
-        // Tutup Settings Modal
-        settingsModal.classList.remove('active');
+                if (hasData) {
+                    lastFilledDateStr = d;
+                    break;
+                }
+            }
 
-        // Buka Condition Modal
-        conditionModal.classList.add('active');
-    });
+            if (lastFilledDateStr) {
+                const lastDate = parseDate(lastFilledDateStr);
+                lastDate.setDate(lastDate.getDate() + 1);
+                nextStart = lastDate;
+            } else {
+                nextStart = new Date();
+            }
 
-    // Tombol Batal - tutup modal kondisi
-    cancelModal.addEventListener('click', function () {
-        conditionModal.classList.remove('active');
-    });
+            const startDate = formatDate(nextStart);
+            const nextEnd = new Date(nextStart);
+            nextEnd.setDate(nextEnd.getDate() + 6);
+            const endDate = formatDate(nextEnd);
 
-    // Klik backdrop - tutup modal kondisi
-    conditionModal.querySelector('.modal-backdrop').addEventListener('click', function () {
-        conditionModal.classList.remove('active');
-    });
+            scheduleData.startDate = startDate;
+            scheduleData.endDate = endDate;
 
-    // Tombol EKSEKUSI - generate jadwal
-    executeBtn.addEventListener('click', function () {
-        const pkYesterday = document.getElementById('pkYesterday').value;
-        const offYesterday = document.getElementById('offYesterday').value;
+            if (startInput) startInput.value = startDate;
+            if (endInput) endInput.value = endDate;
 
-        if (!pkYesterday) {
-            alert('Mohon pilih pemegang kunci kemarin!');
-            return;
-        }
+            try {
+                const newSchedule = generateSchedule();
+                Object.assign(scheduleData.schedule, newSchedule);
+                updateGridValues();
+                if (printBtn) printBtn.style.display = 'inline-flex';
+            } catch (e) {
+                console.error(e);
+                alert('Error fast generate: ' + e.message);
+            }
+        });
+    }
 
-        if (!offYesterday) {
-            alert('Mohon pilih siapa yang libur kemarin!');
-            return;
-        }
+    // --- GENERATE ACTION (Direct Execute) ---
 
-        scheduleData.pkYesterday = pkYesterday;
-        scheduleData.offYesterday = offYesterday;
+    if (generateBtn) {
+        generateBtn.addEventListener('click', function () {
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
 
-        // Generate jadwal
-        scheduleData.schedule = generateSchedule();
+            if (!startDate || !endDate) {
+                alert('Mohon isi tanggal mulai dan selesai!');
+                return;
+            }
 
-        // Tutup modal kondisi
-        conditionModal.classList.remove('active');
+            if (parseDate(startDate) > parseDate(endDate)) {
+                alert('Tanggal mulai harus sebelum tanggal selesai!');
+                return;
+            }
 
-        // Tampilkan tombol print
-        document.getElementById('printBtn').style.display = 'inline-flex';
+            // Parse event dates
+            const eventDatesInput = document.getElementById('eventDates').value;
+            const eventDates = eventDatesInput
+                .split(',')
+                .map(d => d.trim())
+                .filter(d => d && /^\d{4}-\d{2}-\d{2}$/.test(d));
 
-        renderScheduleTable();
-    });
+            // Update Data Layer
+            scheduleData.startDate = startDate;
+            scheduleData.endDate = endDate;
+            scheduleData.eventDates = eventDates;
+
+            // EXECUTE GENERATOR
+            try {
+                const newSchedule = generateSchedule();
+                Object.assign(scheduleData.schedule, newSchedule);
+
+                // Update UI
+                updateGridValues();
+
+                // Close Modal & Show Print
+                if (settingsModal) settingsModal.classList.remove('active');
+                if (printBtn) printBtn.style.display = 'inline-flex';
+
+            } catch (e) {
+                console.error(e);
+                alert('Terjadi kesalahan saat generate jadwal: ' + e.message);
+            }
+        });
+    }
 
     // Tombol Cetak
-    printBtn.addEventListener('click', function () {
-        window.print();
-    });
+    if (printBtn) {
+        printBtn.addEventListener('click', function () {
+            window.print();
+        });
+    }
 });
